@@ -9,7 +9,7 @@
   },
 
   program: {
-    image: "ghcr.io/onejumpinc/medagentbenchmark-deterministic-agent@sha256:REPLACE_WITH_PUBLISHED_DIGEST",
+    image: "ghcr.io/onejumpinc/medagentbenchmark-deterministic-agent@sha256:013417705571ccc6a788f688ed8d4035cd0344a738d1898287c9981142f1c415",
     entrypoint: [
       "uv",
       "run",
