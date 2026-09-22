@@ -1,364 +1,207 @@
-import os
+"""Deterministic FHIR participant for the MedAgentBench patient-search task."""
+
+from __future__ import annotations
+
+import asyncio
 import json
-import httpx
+import os
 import re
-from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from typing import Any
+from urllib.parse import urlparse, urlunparse
+
+import httpx
 from a2a.server.tasks import TaskUpdater
-from a2a.types import Message, TaskState, Part, TextPart
+from a2a.types import Message, Part, TaskState, TextPart
 from a2a.utils import get_message_text, new_agent_text_message
 
-try:
-    from messenger import Messenger
-except ImportError:
-    from .messenger import Messenger
 
-load_dotenv()
+_PATIENT_SEARCH_PATTERNS = (
+    re.compile(
+        r"\bname\s+(?P<name>[\w'\-. ]+?)\s+and\s+DOB\s+(?:of\s+)?"
+        r"(?P<dob>\d{4}-\d{2}-\d{2})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:find|lookup|look\s+up)\s+(?:the\s+)?MRN\s+(?:for|of)\s+"
+        r"(?P<name>[\w'\-. ]+?)\s*\(DOB\s*:\s*"
+        r"(?P<dob>\d{4}-\d{2}-\d{2})\)",
+        re.IGNORECASE,
+    ),
+)
 
-async def search_fhir(base_url: str, resource_type: str, params: dict) -> str:
-    """
-    Search the FHIR server for resources.
-    """
-    if not base_url:
-        return "Error: No FHIR base URL provided."
-    
-    url = f"{base_url.rstrip('/')}/{resource_type}"
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, params=params, timeout=10.0)
-            response.raise_for_status()
-            return json.dumps(response.json())
-    except Exception as e:
-        return f"Error querying FHIR server: {str(e)}"
+def parse_instruction(text: str) -> dict[str, str] | None:
+    """Parse a patient-name and date-of-birth lookup without relying on task IDs."""
 
-
-def search_local_cache(name: str, dob: str) -> str | None:
-    try:
-        # Assuming med_data is in the project root
-        path = "med_data/prefetched-fhir-task1.json"
-        if not os.path.exists(path):
-             return None
-             
-        with open(path, "r") as f:
-            cache = json.load(f)
-            
-        target_name_parts = set(name.lower().split())
-        
-        for task_id, bundle in cache.items():
-            if not isinstance(bundle, dict) or "entry" not in bundle:
-                continue
-            
-            entries = bundle.get("entry", [])
-            if not entries:
-                continue
-                
-            resource = entries[0].get("resource", {})
-            if resource.get("resourceType") != "Patient":
-                continue
-                
-            if resource.get("birthDate") != dob:
-                continue
-                
-            human_names = resource.get("name", [])
-            found_name = False
-            for hn in human_names:
-                family = hn.get("family", "")
-                given = " ".join(hn.get("given", []))
-                full_name_str = f"{given} {family}".lower()
-                
-                if all(part in full_name_str for part in target_name_parts):
-                    found_name = True
-                    break
-            
-            if found_name:
-                return json.dumps(bundle)
-                    
-        return None
-
-    except Exception as e:
-        print(f"Cache lookup failed: {e}")
-        return None
-
-def parse_instruction(text: str) -> dict | None:
-    """
-    Heuristically parse the instruction to identify specific tasks.
-    """
-    # Heuristic: Look for "name ... dob ..." pattern for Patient Search
-    # Example: "Find MRN for Brian Buchanan (DOB: 1954-08-10)" or "name Brian Buchanan and DOB of 1954-08-10"
-    # We'll use a slightly more flexible regex to catch common variations
-    
-    # Matches: "name <Name> and DOB of <YYYY-MM-DD>" (Case insensitive)
-    name_match = re.search(r"name\s+([\w\s]+?)\s+and\s+DOB\s+of\s+(\d{4}-\d{2}-\d{2})", text, re.IGNORECASE)
-    
-    # Fallback/Alternative pattern matches could be added here
-    # For now, implementing the specific requested pattern
-    
-    if name_match:
-        return {
-            "type": "search_patient",
-            "name": name_match.group(1).strip(),
-            "dob": name_match.group(2).strip()
-        }
-
-    # Check for another common pattern: "Find MRN for <Name> (DOB: <YYYY-MM-DD>)"
-    mrn_match = re.search(r"Find\s+MRN\s+for\s+([\w\s]+?)\s+\(DOB:\s*(\d{4}-\d{2}-\d{2})\)", text, re.IGNORECASE)
-    if mrn_match:
-         return {
-            "type": "search_patient",
-            "name": mrn_match.group(1).strip(),
-            "dob": mrn_match.group(2).strip()
-        }
-
-    # Task 2 Pattern: "What's the age of the patient with MRN of <ID>?"
-    age_match = re.search(r"age of the patient with MRN of\s+(S\d+)", text, re.IGNORECASE)
-    if age_match:
-        return {
-            "type": "get_patient_age",
-            "mrn": age_match.group(1).strip()
-        }
-
-    # Task 3 Pattern: "measured the blood pressure for patient with MRN of <ID>, and it is "<BP>""
-    bp_match = re.search(r"measured the blood pressure for patient with MRN of\s+(S\d+).*?is\s+\"([^\"]+)\"", text, re.IGNORECASE)
-    if bp_match:
-        return {
-            "type": "record_vitals",
-            "mrn": bp_match.group(1).strip(),
-            "bp": bp_match.group(2).strip()
-        }
-
+    for pattern in _PATIENT_SEARCH_PATTERNS:
+        match = pattern.search(text or "")
+        if match:
+            return {
+                "type": "search_patient",
+                "name": " ".join(match.group("name").split()),
+                "dob": match.group("dob"),
+            }
     return None
 
+
+def _ensure_fhir_path(url: str) -> str:
+    parsed = urlparse(url.strip())
+    path = parsed.path.rstrip("/")
+    if not path.lower().endswith("/fhir"):
+        path = f"{path}/fhir" if path else "/fhir"
+    return urlunparse(parsed._replace(path=path, params="", query="", fragment=""))
+
+
+def resolve_fhir_base_url(requested_url: str | None) -> str | None:
+    """Resolve the reachable FHIR endpoint inside the benchmark Compose network."""
+
+    configured = os.getenv("FHIR_BASE_URL") or os.getenv("FHIR_SERVER_URL")
+    if configured:
+        return _ensure_fhir_path(configured)
+    if not requested_url:
+        return None
+
+    parsed = urlparse(requested_url)
+    # The current green agent advertises itself as the FHIR callback host even
+    # though the FHIR service is a separate Compose service.
+    if parsed.hostname == "green-agent" and parsed.port == 8080:
+        return "http://fhir-server:8080/fhir"
+    return _ensure_fhir_path(requested_url)
+
+
+async def search_fhir(
+    base_url: str,
+    resource_type: str,
+    params: dict[str, str] | list[tuple[str, str]],
+) -> dict[str, Any]:
+    """Return a decoded FHIR search bundle."""
+
+    url = f"{base_url.rstrip('/')}/{resource_type}"
+    timeout = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0)
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+        response = await client.get(url, params=params)
+        response.raise_for_status()
+        payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("FHIR response must be a JSON object")
+    return payload
+
+
+def _normalized_words(value: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[a-z0-9]+", value.casefold()))
+
+
+def _patient_full_names(resource: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for human_name in resource.get("name", []):
+        if not isinstance(human_name, dict):
+            continue
+        given = human_name.get("given", [])
+        if isinstance(given, str):
+            given = [given]
+        family = str(human_name.get("family", ""))
+        names.append(" ".join([*(str(part) for part in given), family]).strip())
+    return names
+
+
+def _extract_mrn(resource: dict[str, Any]) -> str | None:
+    for identifier in resource.get("identifier", []):
+        if not isinstance(identifier, dict):
+            continue
+        codes = {
+            str(coding.get("code", "")).upper()
+            for coding in (identifier.get("type", {}).get("coding", []) or [])
+            if isinstance(coding, dict)
+        }
+        value = str(identifier.get("value", "")).strip()
+        if value and ("MR" in codes or re.fullmatch(r"S\d{7}", value)):
+            return value
+
+    resource_id = str(resource.get("id", "")).strip()
+    return resource_id if re.fullmatch(r"S\d{7}", resource_id) else None
+
+
+def find_patient_mrn(bundle: dict[str, Any], name: str, dob: str) -> str | None:
+    """Find one exact patient by normalized full name and birth date."""
+
+    target_name = _normalized_words(name)
+    matches: list[str] = []
+    for entry in bundle.get("entry", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        resource = entry.get("resource", {})
+        if not isinstance(resource, dict) or resource.get("resourceType") != "Patient":
+            continue
+        if resource.get("birthDate") != dob:
+            continue
+        if not any(_normalized_words(candidate) == target_name for candidate in _patient_full_names(resource)):
+            continue
+        mrn = _extract_mrn(resource)
+        if mrn:
+            matches.append(mrn)
+
+    unique_matches = sorted(set(matches))
+    return unique_matches[0] if len(unique_matches) == 1 else None
+
+
+async def lookup_patient_mrn(name: str, dob: str, requested_url: str | None) -> str:
+    """Query the benchmark FHIR service and return its authoritative result."""
+
+    base_url = resolve_fhir_base_url(requested_url)
+    if not base_url:
+        raise RuntimeError("FHIR endpoint was not provided")
+
+    name_parts = name.split()
+    params = [("name", part) for part in name_parts]
+    params.append(("birthdate", dob))
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            bundle = await search_fhir(base_url, "Patient", params)
+            mrn = find_patient_mrn(bundle, name, dob)
+            if mrn:
+                print("[FHIR_LOOKUP] source=live status=matched", flush=True)
+                return mrn
+            print("[FHIR_LOOKUP] source=live status=not_found", flush=True)
+            return "Patient not found"
+        except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt == 0:
+                await asyncio.sleep(0.2)
+
+    raise RuntimeError("FHIR patient search failed after two attempts") from last_error
+
+
 class Agent:
-    def __init__(self):
-        self.messenger = Messenger()
-        if os.getenv("NEBIUS_API_KEY"):
-            self.api_key = os.getenv("NEBIUS_API_KEY")
-            self.base_url = "https://api.studio.nebius.ai/v1/"
-            self.model = os.getenv("NEBIUS_MODEL_NAME") or os.getenv("MODEL_NAME") or "deepseek-ai/DeepSeek-R1-0528"
-        elif os.getenv("OPENROUTER_API_KEY"):
-            self.api_key = os.getenv("OPENROUTER_API_KEY")
-            self.base_url = "https://openrouter.ai/api/v1"
-            self.model = os.getenv("OPENROUTER_MODEL_NAME") or os.getenv("MODEL_NAME") or "google/gemini-2.0-flash-exp:free"
-        else:
-            self.api_key = None
-            self.model = None # Will cause error later if used
-        
-        self.client = None
-        if self.api_key:
-            self.client = AsyncOpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url,
-            )
-        else:
-             print("Warning: No API key found for OpenRouter or Nebius.")
+    """A model-free participant that performs exact FHIR patient searches."""
 
-    async def run(self, message: Message, updater: TaskUpdater, task: "Task" = None) -> None:
-        """Implement your agent logic here.
-
-        Args:
-            message: The incoming message
-            updater: Report progress (update_status) and results (add_artifact)
-            task: The current task object containing history
-
-        Use self.messenger.talk_to_agent(message, url) to call other agents.
-        """
+    async def run(self, message: Message, updater: TaskUpdater, task: Any = None) -> None:
+        del task
         input_text = get_message_text(message)
-        print(f"[PURPLE] Received Input: {input_text}", flush=True)
-
-        # 1. Payload Parsing
         try:
             payload = json.loads(input_text)
-            # Check if it looks like the expected Green Agent payload
-            if isinstance(payload, dict) and "instruction" in payload:
-                instruction = payload.get("instruction")
-                fhir_base_url = payload.get("fhir_base_url")
-                system_context = payload.get("system_context")
-            else:
-                # Fallback for plain text or unexpected JSON structure
-                instruction = input_text
-                fhir_base_url = None
-                system_context = None
         except json.JSONDecodeError:
-            instruction = input_text
-            fhir_base_url = None
-            system_context = None
+            payload = {"instruction": input_text}
+
+        if not isinstance(payload, dict):
+            payload = {"instruction": input_text}
+        instruction = str(payload.get("instruction", input_text))
+        parsed = parse_instruction(instruction)
 
         await updater.update_status(
-            TaskState.working, new_agent_text_message("Processing request...")
+            TaskState.working,
+            new_agent_text_message("Searching the FHIR patient index."),
         )
 
-        response_text = ""
-        if not self.client:
-             response_text = "Error: Agent not configured with API key."
-             print(f"[PURPLE] {response_text}", flush=True)
+        if parsed is None:
+            response_text = "Unsupported task: expected a patient name and date of birth."
         else:
-            try:
-                # 2. Heuristic Pre-Fetch
-                heuristic_context = ""
-                parsed_task = parse_instruction(instruction)
-                
-                # If we detected a supported task AND we have a FHIR URL, fetch immediately
-                is_pre_fetched = False
-                skip_tools = False
-
-                if parsed_task and fhir_base_url:
-                    if parsed_task["type"] == "search_patient":
-                        await updater.update_status(
-                            TaskState.working, new_agent_text_message(f"Detected Patient Search: Fetching data for {parsed_task['name']}...")
-                        )
-                        
-                        # Task 1 Optimization: Prioritize Local Cache
-                        print(f"[PURPLE] Checking local cache for {parsed_task['name']}...")
-                        cached_data = search_local_cache(parsed_task["name"], parsed_task["dob"])
-                        
-                        if cached_data:
-                             data = cached_data
-                             heuristic_context = f"\n[CONTEXT FROM CACHE]:\n{data}\n"
-                             await updater.update_status(
-                                TaskState.working, new_agent_text_message(f"Found cached data for {parsed_task['name']}.")
-                            )
-                        else:
-                             # Fallback to Live FHIR
-                             print(f"[PURPLE] Cache miss. Fetching from FHIR server...")
-                             name_parts = parsed_task["name"].split()
-                             params = {
-                                "name": name_parts if len(name_parts) > 1 else parsed_task["name"],
-                                "birthdate": parsed_task["dob"]
-                             }
-                             data = await search_fhir(
-                                fhir_base_url, 
-                                "Patient", 
-                                params
-                             )
-                             heuristic_context = f"\n[CONTEXT FROM FHIR (Pre-fetched)]:\n{data}\n"
-                        
-                        is_pre_fetched = True
-                        skip_tools = True # Task 1 optimization: Skip tools
-
-                    elif parsed_task["type"] == "get_patient_age":
-                        await updater.update_status(
-                            TaskState.working, new_agent_text_message(f"Detected Age Check: Fetching patient {parsed_task['mrn']}...")
-                        )
-                        # Fetch by ID (assuming MRN maps to ID 'Sxxxx' in this benchmark per implementation plan)
-                        params = {"_id": parsed_task["mrn"]} 
-                        data = await search_fhir(fhir_base_url, "Patient", params)
-                        heuristic_context = f"\n[CONTEXT FROM FHIR (Pre-fetched)]:\n{data}\n"
-                        is_pre_fetched = True
-                        skip_tools = True # Task 2 optimization: Skip tools (LLM can calc age from context)
-
-                    elif parsed_task["type"] == "record_vitals":
-                        await updater.update_status(
-                            TaskState.working, new_agent_text_message(f"Detected Vitals Record: Fetching patient {parsed_task['mrn']} context...")
-                        )
-                        # Fetch by ID to provide valid reference context
-                        params = {"_id": parsed_task["mrn"]}
-                        data = await search_fhir(fhir_base_url, "Patient", params)
-                        heuristic_context = f"\n[CONTEXT FROM FHIR (Pre-fetched)]:\n{data}\n"
-                        is_pre_fetched = True
-                        skip_tools = False # Task 3 optimization: DO NOT skip tools (LLM needs to POST)
-
-                # 3. Context Injection & Prompt Construction
-                system_prompt = "You are a helpful medical AI assistant. You are participating in a medical benchmark. Answer questions accurately and concisely."
-                if system_context:
-                    system_prompt += f"\n\nCurrent Context: {system_context}"
-                
-                # If we pre-fetched, we don't necessarily need the tool instruction as strictly, 
-                # but we still tell it about validity.
-                if fhir_base_url:
-                    if is_pre_fetched:
-                        system_prompt += f"\n\nRelevant FHIR data has been pre-fetched and provided below. Use this context to answer the user's question directly."
-                    else:
-                        system_prompt += f"\nYou have access to a FHIR server at: {fhir_base_url}\nWhen asked to retrieve patient information, ALWAYS use the provided FHIR server URL using the `search_fhir` tool. Do not hallucinate data."
-
-                messages = [{"role": "system", "content": system_prompt}]
-                
-                # Handling History
-                if task and task.history:
-                     for msg in task.history:
-                        role = "user" if msg.role == "user" else "assistant" # Map 'agent' to 'assistant'
-                        if msg.role == "agent":
-                             role = "assistant"
-                        
-                        text = get_message_text(msg)
-                        if text:
-                            messages.append({"role": role, "content": text})
-
-                user_content = instruction + heuristic_context
-                messages.append({"role": "user", "content": user_content})
-
-                # 4. Tool Configuration
-                tools = []
-                if fhir_base_url and not skip_tools:
-                    tools.append({
-                        "type": "function",
-                        "function": {
-                            "name": "search_fhir",
-                            "description": "Search for resources on the FHIR server.",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "resource_type": {
-                                        "type": "string",
-                                        "description": "The type of FHIR resource to search for (e.g., 'Patient', 'Observation', 'Condition')."
-                                    },
-                                    "params": {
-                                        "type": "object",
-                                        "description": "Key-value pairs for search parameters (e.g., {'name': 'John', 'birthdate': '1980-01-01'})."
-                                    }
-                                },
-                                "required": ["resource_type", "params"]
-                            }
-                        }
-                    })
-
-                # Log the full prompt
-                print(f"[PURPLE] Sending Prompt to LLM ({self.model}):\n{json.dumps(messages, indent=2)}", flush=True)
-
-                # 5. LLM Call
-                completion = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=tools if tools else None,
-                )
-                
-                message = completion.choices[0].message
-                
-                # Handle tool calls (Legacy path or if pre-fetch missed)
-                if message.tool_calls:
-                    messages.append(message) # Add the assistant's message with tool_calls
-                    
-                    for tool_call in message.tool_calls:
-                        if tool_call.function.name == "search_fhir":
-                            func_args = json.loads(tool_call.function.arguments)
-                            resource_type = func_args.get("resource_type")
-                            params = func_args.get("params")
-                            
-                            # Execute tool
-                            tool_result = await search_fhir(fhir_base_url, resource_type, params)
-                            
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": "search_fhir",
-                                "content": tool_result
-                            })
-                    
-                    # Call LLM again with tool results
-                    second_completion = await self.client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        # tools=tools # Optional
-                    )
-                    response_text = second_completion.choices[0].message.content
-                else:
-                    response_text = message.content
-
-            except Exception as e:
-                import traceback
-                response_text = f"Error calling LLM: {str(e)}\n{traceback.format_exc()}"
-                print(f"[PURPLE] Exception: {response_text}", flush=True)
+            response_text = await lookup_patient_mrn(
+                parsed["name"],
+                parsed["dob"],
+                payload.get("fhir_base_url"),
+            )
 
         await updater.add_artifact(
             parts=[Part(root=TextPart(text=response_text))],
-            name="Response",
+            name="FHIR patient-search result",
         )

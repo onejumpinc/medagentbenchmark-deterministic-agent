@@ -24,16 +24,16 @@ def main():
     # See: https://a2a-protocol.org/latest/tutorials/python/3-agent-skills-and-card/
     
     skill = AgentSkill(
-        id="medical-qa",
-        name="Medical Question Answering",
-        description="Answers medical questions using LLMs",
-        tags=["medical", "qa"],
-        examples=["What are symptoms of flu?"]
+        id="fhir-patient-search",
+        name="FHIR Patient Search",
+        description="Finds an exact patient MRN from a full name and date of birth.",
+        tags=["medical", "fhir", "patient-search"],
+        examples=["What's the MRN for Jane Doe with DOB 1970-01-01?"]
     )
 
     agent_card = AgentCard(
-        name="Purple Agent",
-        description="Purple Participant Agent for MedAgentBenchmark",
+        name="One Jump Deterministic FHIR Agent",
+        description="Model-free FHIR patient-search participant for MedAgentBenchmark",
         url=args.card_url or f"http://{args.host}:{args.port}/",
         version='1.0.0',
         default_input_modes=['text'],

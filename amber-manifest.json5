@@ -1,0 +1,43 @@
+{
+  manifest_version: "0.1.0",
+
+  config_schema: {
+    type: "object",
+    properties: {},
+    required: [],
+    additionalProperties: false,
+  },
+
+  program: {
+    image: "ghcr.io/onejumpinc/medagentbenchmark-deterministic-agent@sha256:REPLACE_WITH_PUBLISHED_DIGEST",
+    entrypoint: [
+      "uv",
+      "run",
+      "src/server.py",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "9009",
+      "--card-url",
+      "http://purple_agent:9009/",
+    ],
+    env: {
+      PYTHONUNBUFFERED: "1",
+      FHIR_SERVER_URL: "http://fhir-server:8080",
+    },
+    network: {
+      endpoints: [{ name: "a2a_endpoint", port: 9009 }],
+    },
+  },
+
+  slots: {},
+  provides: { a2a: { kind: "a2a", endpoint: "a2a_endpoint" } },
+  exports: { a2a: "a2a" },
+
+  metadata: {
+    name: "One Jump Deterministic FHIR Agent",
+    description: "Model-free exact patient lookup for the public MedAgentBench patient-search scenario.",
+    benchmark: "MedAgentBench",
+    participant_roles: ["purple_agent"],
+  },
+}

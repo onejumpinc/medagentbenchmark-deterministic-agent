@@ -1,88 +1,336 @@
-name: Test and Publish Agent
+name: Validate and publish deterministic MedAgentBench agent
 
 on:
   pull_request:
   push:
-    branches:
-      - main
-    tags:
-      - "v*"
+    branches: [main]
+    paths:
+      - ".github/workflows/test-and-publish.yml"
+      - ".dockerignore"
+      - "Dockerfile"
+      - "pyproject.toml"
+      - "src/**"
+      - "tests/**"
+      - "uv.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: medagentbench-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GREEN_IMAGE: ghcr.io/udapy/medagentbench-green-agent@sha256:f5b35339156bde6e44d378cbb7cda50523e17ddd2909202bf8d47e9f5236938b
+  FHIR_IMAGE: ghcr.io/udapy/medagentbench-fhir-server@sha256:c16d4befd935005680526df9b2c8e23530e1681aec9a0d13d326f78fb6c66fac
+  CLIENT_IMAGE: ghcr.io/agentbeats/agentbeats-client@sha256:13dfe3ef4e583a80e7ce2fe3becd0ce3b879841368a7f4fa40b6ebbabeeb014e
+  IMAGE_NAME: ghcr.io/onejumpinc/medagentbenchmark-deterministic-agent
 
 jobs:
-  test-and-publish:
+  validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-    # These permissions are required for the workflow to:
-    # - Read repository contents (checkout code)
-    # - Write to GitHub Container Registry (push Docker images)
+      - name: Set up uv
+        uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+        with:
+          version: "0.11.1"
+          enable-cache: true
+
+      - name: Run deterministic unit and protocol tests
+        run: |
+          uv sync --frozen --extra test
+          uv run pytest -q \
+            tests/test_agent_heuristic.py \
+            tests/simulation/test_purple_payload.py
+          uv run python -m compileall -q src tests
+
+      - name: Build tested Linux/AMD64 image
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --build-arg VCS_REF="${GITHUB_SHA}" \
+            --build-arg SOURCE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --tag medagentbench-deterministic-agent:test \
+            .
+          test "$(docker image inspect --format '{{.Config.User}}' \
+            medagentbench-deterministic-agent:test)" = "agent"
+          test "$(docker image inspect \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+            medagentbench-deterministic-agent:test)" = "${GITHUB_SHA}"
+
+      - name: Run two fresh exact four-task assessments
+        id: exact
+        run: |
+          set -euo pipefail
+          cleanup() {
+            docker logs medagent-purple > "${RUNNER_TEMP}/purple-cleanup.log" 2>&1 || true
+            docker logs medagent-green > "${RUNNER_TEMP}/green-cleanup.log" 2>&1 || true
+            docker logs medagent-fhir > "${RUNNER_TEMP}/fhir-cleanup.log" 2>&1 || true
+            docker rm -f medagent-purple medagent-green medagent-fhir >/dev/null 2>&1 || true
+            docker network rm medagent-validation >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          participant_image_id=$(docker image inspect --format '{{.Id}}' \
+            medagentbench-deterministic-agent:test)
+
+          for run_number in 1 2; do
+            run_dir="${RUNNER_TEMP}/medagent-run-${run_number}"
+            mkdir -p "${run_dir}/output"
+            chmod 777 "${run_dir}/output"
+            cat > "${run_dir}/scenario.toml" <<'SCENARIO'
+          [green_agent]
+          endpoint = "http://green-agent:9009"
+
+          [[participants]]
+          role = "purple_agent"
+          endpoint = "http://purple_agent:9009"
+
+          [config]
+          task_ids = ["task1_5", "task1_6", "task1_7", "task1_8"]
+          max_iterations = 10
+          SCENARIO
+
+            docker network create medagent-validation
+            docker run --detach \
+              --name medagent-fhir \
+              --network medagent-validation \
+              --network-alias fhir-server \
+              --publish 18080:8080 \
+              "${FHIR_IMAGE}"
+
+            ready=false
+            for _ in $(seq 1 180); do
+              if curl --fail --silent \
+                http://127.0.0.1:18080/fhir/metadata >/dev/null; then
+                ready=true
+                break
+              fi
+              sleep 2
+            done
+            test "${ready}" = true
+
+            docker run --detach \
+              --name medagent-purple \
+              --network medagent-validation \
+              --network-alias purple_agent \
+              --env FHIR_SERVER_URL=http://fhir-server:8080 \
+              --publish 19090:9009 \
+              medagentbench-deterministic-agent:test \
+              --host 0.0.0.0 \
+              --port 9009 \
+              --card-url http://purple_agent:9009/
+
+            docker run --detach \
+              --name medagent-green \
+              --network medagent-validation \
+              --network-alias green-agent \
+              --env FHIR_SERVER_URL=http://fhir-server:8080 \
+              --env FHIR_CALLBACK_HOST=fhir-server \
+              --publish 19091:9009 \
+              "${GREEN_IMAGE}" \
+              --host 0.0.0.0 \
+              --port 9009 \
+              --card-url http://green-agent:9009
+
+            for url in \
+              http://127.0.0.1:19090/.well-known/agent-card.json \
+              http://127.0.0.1:19091/.well-known/agent-card.json; do
+              ready=false
+              for _ in $(seq 1 90); do
+                if curl --fail --silent "${url}" >/dev/null; then
+                  ready=true
+                  break
+                fi
+                sleep 1
+              done
+              test "${ready}" = true
+            done
+
+            docker run --rm \
+              --network medagent-validation \
+              --volume "${run_dir}/scenario.toml:/app/scenario.toml:ro" \
+              --volume "${run_dir}/output:/app/output" \
+              "${CLIENT_IMAGE}" \
+              scenario.toml output/results.json
+
+            jq -e '
+              ([.results[] | select(.artifact_type == "result")] | length) == 4 and
+              ([.results[] | select(.artifact_type == "result") | .task_id] | sort) ==
+                ["task1_5", "task1_6", "task1_7", "task1_8"] and
+              all(.results[] | select(.artifact_type == "result");
+                .task_id as $task_id |
+                .score == 1.0 and
+                .feedback == "Correct" and
+                .metadata.raw_response == ({
+                    "task1_5": "S2703270",
+                    "task1_6": "S2874099",
+                    "task1_7": "S6200102",
+                    "task1_8": "S6530532"
+                  }[$task_id])) and
+              ([.results[] | select(.artifact_type == "evaluation_summary")] | length) == 1 and
+              all(.results[] | select(.artifact_type == "evaluation_summary");
+                .total_tasks == 4 and
+                .passed_tasks == 4 and
+                .failed_tasks == [] and
+                .score_summary == "4/4")
+            ' "${run_dir}/output/results.json" >/dev/null
+
+            printf '%s\n' "${participant_image_id}" > "${run_dir}/participant-image-id.txt"
+            docker logs medagent-purple > "${run_dir}/purple.log" 2>&1
+            docker logs medagent-green > "${run_dir}/green.log" 2>&1
+            docker logs medagent-fhir > "${run_dir}/fhir.log" 2>&1
+            test "$(grep -c '^\[FHIR_LOOKUP\] source=live status=matched$' \
+              "${run_dir}/purple.log")" = "4"
+            if grep -Eiq 'source=(cache|offline)|prefetched' "${run_dir}/purple.log"; then
+              echo "Participant log indicates a non-live answer source" >&2
+              exit 1
+            fi
+            docker rm -f medagent-purple medagent-green medagent-fhir >/dev/null
+            docker network rm medagent-validation >/dev/null
+          done
+
+      - name: Preserve exact-run evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: medagentbench-exact-2x4-linux-amd64
+          path: |
+            ${{ runner.temp }}/medagent-run-1
+            ${{ runner.temp }}/medagent-run-2
+          if-no-files-found: error
+
+      - name: Preserve failure logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: medagentbench-failure-logs
+          path: |
+            ${{ runner.temp }}/purple-cleanup.log
+            ${{ runner.temp }}/green-cleanup.log
+            ${{ runner.temp }}/fhir-cleanup.log
+            ${{ runner.temp }}/medagent-run-1
+            ${{ runner.temp }}/medagent-run-2
+          if-no-files-found: warn
+
+      - name: Package the exact-tested image
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: |
+          actual_id=$(docker image inspect --format '{{.Id}}' \
+            medagentbench-deterministic-agent:test)
+          for run_number in 1 2; do
+            test "$(cat "${RUNNER_TEMP}/medagent-run-${run_number}/participant-image-id.txt")" = \
+              "${actual_id}"
+          done
+          printf '%s\n' "${actual_id}" > "${RUNNER_TEMP}/participant-image-id.txt"
+          docker save --output "${RUNNER_TEMP}/participant-image.tar" \
+            medagentbench-deterministic-agent:test
+
+      - name: Transfer the exact-tested image
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: exact-tested-medagentbench-image
+          path: |
+            ${{ runner.temp }}/participant-image.tar
+            ${{ runner.temp }}/participant-image-id.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Record validation summary
+        if: always()
+        env:
+          EXACT_OUTCOME: ${{ steps.exact.outcome }}
+        run: |
+          if [ "${EXACT_OUTCOME}" = "success" ]; then
+            echo "MedAgentBench exact gate: 8/8 tasks across two fresh full-stack assessments" \
+              >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "MedAgentBench exact gate did not complete successfully" \
+              >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+  publish:
+    needs: validate
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Extract metadata for Docker
-        id: meta
-        uses: docker/metadata-action@v5
+      - name: Download exact-tested image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          images: ghcr.io/${{ github.repository_owner }}/medagentbench-purple-agent
-          tags: |
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable={{is_default_branch}}
+          name: exact-tested-medagentbench-image
+          path: ${{ runner.temp }}/exact-tested-image
 
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: false
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          load: true
-          platforms: linux/amd64
-
-      - name: Start agent container
-        env:
-          SECRETS_JSON: ${{ toJson(secrets) }}
+      - name: Load and verify transferred image
         run: |
-          echo "$SECRETS_JSON" | jq -r 'to_entries[] | "\(.key)=\(.value)"' > .env
-          docker run -d -p 9009:9009 --name agent-container --env-file .env $(echo "${{ steps.meta.outputs.tags }}" | head -n1) --host 0.0.0.0 --port 9009
-          timeout 30 bash -c 'until curl -sf http://localhost:9009/.well-known/agent-card.json > /dev/null; do sleep 1; done'
+          docker load --input "${RUNNER_TEMP}/exact-tested-image/participant-image.tar"
+          expected_id=$(cat "${RUNNER_TEMP}/exact-tested-image/participant-image-id.txt")
+          actual_id=$(docker image inspect --format '{{.Id}}' \
+            medagentbench-deterministic-agent:test)
+          test "${actual_id}" = "${expected_id}"
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v4
-
-      - name: Install test dependencies
-        run: uv sync --extra test
-
-      - name: Run tests
-        run: uv run pytest -v --agent-url http://localhost:9009
-
-      - name: Stop container and show logs
-        if: always()
-        run: |
-          echo "=== Agent Container Logs ==="
-          docker logs agent-container || true
-          docker stop agent-container || true
-
-      - name: Log in to GitHub Container Registry
-        if: success() && github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push Docker image
-        if: success() && github.event_name != 'pull_request'
-        run: docker push --all-tags ghcr.io/${{ github.repository_owner }}/medagentbench-purple-agent
-
-      - name: Output image digest
-        if: success() && github.event_name != 'pull_request'
+      - name: Publish exact-tested image
+        id: publish
         run: |
-          echo "## Docker Image Published :rocket:" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Tags:** ${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          docker tag medagentbench-deterministic-agent:test \
+            "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          docker push "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          docker pull "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          digest_ref=$(docker inspect --format='{{index .RepoDigests 0}}' \
+            "${IMAGE_NAME}:sha-${GITHUB_SHA}")
+          case "${digest_ref}" in
+            "${IMAGE_NAME}@sha256:"*) ;;
+            *) echo "Unexpected digest: ${digest_ref}" >&2; exit 1 ;;
+          esac
+          expected_id=$(cat "${RUNNER_TEMP}/exact-tested-image/participant-image-id.txt")
+          docker image rm "${IMAGE_NAME}:sha-${GITHUB_SHA}" \
+            medagentbench-deterministic-agent:test
+          docker pull "${digest_ref}"
+          test "$(docker image inspect --format '{{.Id}}' "${digest_ref}")" = \
+            "${expected_id}"
+          sed -E \
+            "s#${IMAGE_NAME}@sha256:(REPLACE_WITH_PUBLISHED_DIGEST|[0-9a-f]{64})#${digest_ref}#" \
+            amber-manifest.json5 \
+            > "${RUNNER_TEMP}/amber-manifest.published.json5"
+          grep --fixed-strings --quiet "image: \"${digest_ref}\"," \
+            "${RUNNER_TEMP}/amber-manifest.published.json5"
+          docker tag "${digest_ref}" "${IMAGE_NAME}:latest"
+          docker push "${IMAGE_NAME}:latest"
+          echo "digest=${digest_ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Preserve digest-pinned registration manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: medagentbench-release-manifest
+          path: ${{ runner.temp }}/amber-manifest.published.json5
+          if-no-files-found: error
+
+      - name: Record publishing summary
+        env:
+          PUBLISHED_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          echo "Published exact-tested image: ${PUBLISHED_DIGEST}" \
+            >> "${GITHUB_STEP_SUMMARY}"

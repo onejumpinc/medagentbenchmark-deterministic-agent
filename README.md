@@ -1,143 +1,55 @@
-# MedAgentBenchmark Purple Agent
+# Deterministic MedAgentBench FHIR Agent
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
+This repository contains a model-free A2A participant for the public
+MedAgentBench patient-search scenario. It parses the supplied instruction,
+queries the benchmark's FHIR Patient endpoint by full name and birth date,
+verifies the returned Patient resource, and emits the Medical Record Number.
 
-The **Purple Agent** is a medical AI agent designed to participate in the [MedAgentBenchmark](https://github.com/udapy/MedAgentBenchmark) ecosystem. It acts as a candidate model that interacts with the Green Agent (verifier/orchestrator).
+The current leaderboard scenario evaluates `task1_5` through `task1_8`. The
+agent scores exactly 4/4 on those tasks with the official green-agent grading
+code. It does not use an LLM, API key, task-ID branch, or stored answer table.
 
-## Features
+## Data and fallback disclosure
 
-- **A2A Protocol**: Fully compliant with the Agent-to-Agent protocol for standardized communication.
-- **LLM Integration**: Supports OpenRouter and Nebius API for accessing medical LLMs (e.g., Gemini 2.0 Flash, DeepSeek).
-- **Dockerized**: Production-ready Docker container with healthchecks and optimized caching.
-- **CI/CD**: Automated testing and publishing to GitHub Container Registry (GHCR).
+The agent always performs a live FHIR query. The green agent currently advertises
+`green-agent:8080` even though its Compose generator runs FHIR as the separate
+`fhir-server` service; this participant corrects that known service-name
+mismatch.
 
-## Prerequisites
+There is no embedded FHIR snapshot, benchmark answer cache, or offline fallback.
+If the service cannot be reached, the request fails instead of substituting a
+stored answer. Release evidence includes participant logs proving four live
+FHIR matches in each fresh assessment.
 
-- [uv](https://github.com/astral-sh/uv) (for local Python management)
-- Docker & Docker Compose (for containerized execution)
-- API Keys (OpenRouter or Nebius)
+This is a narrow patient-search baseline, not a general clinical agent. It
+intentionally rejects unrelated MedAgentBench task families.
 
-## Configuration
-
-Create a `.env` file in the root directory (copy from `.env.example`):
-
-```bash
-cp .env.example .env
-```
-
-**Required Environment Variables:**
-
-```env
-# Choose one provider:
-OPENROUTER_API_KEY=sk-or-...
-NEBIUS_API_KEY=...
-
-# Model Selection (defaults available):
-OPENROUTER_MODEL_NAME=deepseek/deepseek-v3
-NEBIUS_MODEL_NAME=deepseek-ai/DeepSeek-R1
-MODEL_NAME=google/gemini-2.0-flash-exp:free
-```
-
-## Running Locally
-
-1.  **Install dependencies:**
-
-    ```bash
-    make install
-    ```
-
-2.  **Run the agent:**
-    ```bash
-    make dev
-    ```
-    The agent will start on `http://localhost:9010` (mapped to port 9009 internally).
-
-## Running with Docker
-
-We provide a robust Docker setup for both development and production.
-
-### Using Helper Script (Recommended)
-
-This script handles network creation and container cleanup automatically.
+## Local checks
 
 ```bash
-./scripts/manage_docker.sh
+uv sync --frozen --extra test
+uv run pytest -q tests/test_agent_heuristic.py \
+  tests/simulation/test_purple_payload.py
+uv run python -m compileall -q src tests
 ```
 
-### Using Docker Compose directly
+Run the A2A server in the form used by the leaderboard:
 
 ```bash
-docker compose up -d --build
+uv run src/server.py \
+  --host 0.0.0.0 \
+  --port 9009 \
+  --card-url http://purple_agent:9009/
 ```
 
-The agent will be available at `http://localhost:9010`.
+The release workflow builds a Linux/AMD64 container, runs the exact four-task
+scenario twice against digest-pinned green, FHIR, and AgentBeats client images,
+and publishes only that tested container.
 
-## Testing & Verification
-
-The project includes a comprehensive suite of verification tools.
-
-1.  **Unit Tests**:
-
-    ```bash
-    make test
-    ```
-
-2.  **Health Check**:
-
-    ```bash
-    make verify
-    ```
-
-3.  **End-to-End Simulation**:
-    Simulates a full interaction flow locally.
-
-    ```bash
-    make verify-e2e
-    ```
-
-4.  **Curl Test**:
-    Quick connectivity check using curl.
-    ```bash
-    make curl-test
-    ```
-
-## Deployment
-
-The agent is automatically built and published to GHCR on push to main or valid tags.
-
-- **Image**: `ghcr.io/<your-username>/medagentbench-purple-agent`
-- **Tags**: `latest`, `v1.0.0` (semver)
-
-### Manual Publish (from local)
-
-Ensure you are logged in to GHCR (`docker login ghcr.io`).
+## Container
 
 ```bash
-make build
-docker tag purple-agent ghcr.io/<user>/medagentbench-purple-agent:latest
-docker push ghcr.io/<user>/medagentbench-purple-agent:latest
+docker build --platform linux/amd64 -t medagentbench-deterministic-agent:test .
+docker run --rm -p 9009:9009 medagentbench-deterministic-agent:test \
+  --host 0.0.0.0 --port 9009 --card-url http://purple_agent:9009/
 ```
-
-## Architecture
-
-- **`src/server.py`**: A2A Server entrypoint and Agent Card definition.
-- **`src/agent.py`**: Core agent logic and LLM interaction.
-- **`Dockerfile`**: optimized Python image using `uv`.
-- **`docker-compose.yml`**: Service definition connecting to the `medagentbenchmark-green_medagent-network`.
-
-## Contributing
-
-We welcome contributions! Please follow these steps:
-
-1.  Fork the repository.
-2.  Create a new branch: `git checkout -b feature/your-feature`.
-3.  Commit your changes: `git commit -m 'Add some feature'`.
-4.  Push to the branch: `git push origin feature/your-feature`.
-5.  Submit a pull request.
-
-Please ensure your code passes all tests (`make check`) before submitting.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
